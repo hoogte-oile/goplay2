@@ -1,4 +1,4 @@
-name: face-swap-cpu-real
+name: simswap-512-cpu-real
 on:
   push:
     branches:
@@ -6,9 +6,9 @@ on:
 permissions:
   contents: read
 jobs:
-  inswapper-cpu:
+  simswap512-cpu:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,50 +17,88 @@ jobs:
       - name: Decode inputs
         run: |
           set -euxo pipefail
-          mkdir -p inputs outputs weights
+          mkdir -p inputs outputs
           base64 -di .faceswap_eval_20260916/b64/src_male.jpg.b64 > inputs/src_male.jpg
           base64 -di .faceswap_eval_20260916/b64/target_male.jpg.b64 > inputs/target_male.jpg
           base64 -di .faceswap_eval_20260916/b64/src_female.jpg.b64 > inputs/src_female.jpg
           base64 -di .faceswap_eval_20260916/b64/target_female.jpg.b64 > inputs/target_female.jpg
           file inputs/*.jpg
-          ls -lh inputs
-      - name: Install InSwapper CPU stack
+      - name: Install CPU stack and SimSwap
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.2.2 torchvision==0.17.2
           python -m pip install 'numpy<2' 'opencv-python-headless<4.12' onnxruntime insightface==0.7.3 Pillow
-          curl -fL --retry 5 --retry-delay 3 'https://huggingface.co/JackCui/facefusion/resolve/main/inswapper_128.onnx?download=true' -o weights/inswapper_128.onnx
-          sha256sum weights/inswapper_128.onnx
-      - name: Verify and run InSwapper male and female on CPU
+          git clone --depth 1 https://github.com/neuralchen/SimSwap.git SimSwap
+          mkdir -p SimSwap/arcface_model SimSwap/checkpoints
+          curl -fL --retry 5 --retry-delay 3 https://github.com/neuralchen/SimSwap/releases/download/512_beta/512.zip -o /tmp/512.zip
+          unzip -o /tmp/512.zip -d SimSwap/checkpoints
+          curl -fL --retry 5 --retry-delay 3 https://github.com/neuralchen/SimSwap/releases/download/1.0/arcface_checkpoint.tar -o SimSwap/arcface_model/arcface_checkpoint.tar
+          find SimSwap/checkpoints -maxdepth 4 -type f -printf '%p %s bytes\n'
+          ls -lh SimSwap/arcface_model/arcface_checkpoint.tar
+      - name: Run SimSwap 512 generator on CPU
         run: |
           python - <<'PY'
-          from PIL import Image
-          import cv2,json,time,os
+          import os,sys,glob,json,time,cv2,numpy as np,torch
+          import torch.nn.functional as F
+          sys.path.insert(0,os.path.abspath('SimSwap'))
+          from models.fs_networks_512 import Generator_Adain_Upsample
           from insightface.app import FaceAnalysis
-          from insightface.model_zoo import get_model
-          for p in ['inputs/src_male.jpg','inputs/target_male.jpg','inputs/src_female.jpg','inputs/target_female.jpg']:
-              im=Image.open(p); im.verify(); print('verified',p,os.path.getsize(p))
-          app=FaceAnalysis(name='buffalo_l',providers=['CPUExecutionProvider'])
-          t0=time.perf_counter(); app.prepare(ctx_id=-1,det_size=(640,640)); t1=time.perf_counter()
-          swapper=get_model('weights/inswapper_128.onnx',providers=['CPUExecutionProvider']); t2=time.perf_counter()
+
+          ffhq=np.array([[192.98138,239.94708],[318.90277,240.1936],[256.63416,314.01935],[201.26117,371.41043],[313.08905,371.15118]],dtype=np.float32)
+          def align(img,kps):
+              M,_=cv2.estimateAffinePartial2D(kps.astype(np.float32),ffhq,method=cv2.LMEDS)
+              if M is None: raise RuntimeError('affine estimation failed')
+              crop=cv2.warpAffine(img,M,(512,512),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+              return crop,M
           def largest(fs): return max(fs,key=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-          report={'faceanalysis_init_s':t1-t0,'swapper_load_s':t2-t1,'pairs':{}}
-          for name in ['male','female']:
-              src=cv2.imread(f'inputs/src_{name}.jpg'); tgt=cv2.imread(f'inputs/target_{name}.jpg')
-              a=time.perf_counter(); sf=app.get(src); b=time.perf_counter(); tf=app.get(tgt); c=time.perf_counter()
-              if not sf or not tf: raise RuntimeError(f'detection failed {name}: src={len(sf)} tgt={len(tf)}')
-              s,t=largest(sf),largest(tf)
-              out=swapper.get(tgt,t,s,paste_back=True); d=time.perf_counter()
-              cv2.imwrite(f'outputs/inswapper_{name}.jpg',out,[cv2.IMWRITE_JPEG_QUALITY,98])
-              report['pairs'][name]={'src_detect_s':b-a,'target_detect_s':c-b,'swap_s':d-c,'total_s':d-a,
-                  'src_bbox':[float(x) for x in s.bbox],'target_bbox':[float(x) for x in t.bbox]}
-          open('outputs/inswapper_timing.json','w').write(json.dumps(report,indent=2))
-          print(json.dumps(report,indent=2))
+          def tensor_rgb(bgr):
+              rgb=cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+              return torch.from_numpy(rgb).permute(2,0,1).unsqueeze(0)
+          def paste(ori,swap_rgb,M):
+              H,W=ori.shape[:2]; Minv=cv2.invertAffineTransform(M)
+              warped=cv2.warpAffine(swap_rgb.astype(np.float32)/255.0,Minv,(W,H),flags=cv2.INTER_LINEAR)
+              white=np.full((512,512),255,dtype=np.float32)
+              mask=cv2.warpAffine(white,Minv,(W,H)); mask[mask>20]=255
+              mask=cv2.erode(mask,np.ones((40,40),np.uint8),iterations=1)
+              mask=cv2.GaussianBlur(mask,(41,41),0)/255.0
+              warped_bgr=warped[:,:,::-1]*255.0
+              out=mask[:,:,None]*warped_bgr+(1-mask[:,:,None])*ori.astype(np.float32)
+              return np.clip(out,0,255).astype(np.uint8)
+
+          gpaths=glob.glob('SimSwap/checkpoints/**/*_net_G.pth',recursive=True)
+          if not gpaths: raise RuntimeError('512 generator checkpoint not found')
+          gpath=gpaths[0]; print('generator',gpath)
+          t0=time.perf_counter()
+          G=Generator_Adain_Upsample(input_nc=3,output_nc=3,latent_size=512,n_blocks=9,deep=False).cpu().eval()
+          sd=torch.load(gpath,map_location='cpu')
+          G.load_state_dict(sd,strict=True)
+          arc=torch.load('SimSwap/arcface_model/arcface_checkpoint.tar',map_location='cpu')
+          arc=arc.cpu().eval(); t1=time.perf_counter()
+          print('arc type',type(arc))
+          app=FaceAnalysis(name='buffalo_l',providers=['CPUExecutionProvider']); app.prepare(ctx_id=-1,det_size=(640,640)); t2=time.perf_counter()
+          mean=torch.tensor([0.485,0.456,0.406]).view(1,3,1,1); std=torch.tensor([0.229,0.224,0.225]).view(1,3,1,1)
+          report={'model_load_s':t1-t0,'faceanalysis_init_s':t2-t1,'pairs':{}}
+          with torch.inference_mode():
+              for name in ['male','female']:
+                  src=cv2.imread(f'inputs/src_{name}.jpg'); tgt=cv2.imread(f'inputs/target_{name}.jpg')
+                  a=time.perf_counter(); sf=app.get(src); tf=app.get(tgt); b=time.perf_counter()
+                  if not sf or not tf: raise RuntimeError(f'detection failed {name}: {len(sf)} {len(tf)}')
+                  scrop,_=align(src,largest(sf).kps); tcrop,M=align(tgt,largest(tf).kps); c=time.perf_counter()
+                  sid=tensor_rgb(scrop); sid=F.interpolate(sid,size=(112,112),mode='bilinear',align_corners=False); sid=(sid-mean)/std
+                  latent=F.normalize(arc(sid),p=2,dim=1); d=time.perf_counter()
+                  tout=tensor_rgb(tcrop); generated=G(tout,latent)[0].clamp(0,1); e=time.perf_counter()
+                  swap_rgb=(generated.permute(1,2,0).cpu().numpy()*255.0).astype(np.uint8)
+                  out=paste(tgt,swap_rgb,M); f=time.perf_counter()
+                  cv2.imwrite(f'outputs/simswap512_{name}.jpg',out,[cv2.IMWRITE_JPEG_QUALITY,98])
+                  cv2.imwrite(f'outputs/simswap512_{name}_crop.jpg',cv2.cvtColor(swap_rgb,cv2.COLOR_RGB2BGR),[cv2.IMWRITE_JPEG_QUALITY,98])
+                  report['pairs'][name]={'detect_s':b-a,'align_s':c-b,'arcface_s':d-c,'generator_s':e-d,'paste_s':f-e,'total_s':f-a}
+          open('outputs/simswap512_timing.json','w').write(json.dumps(report,indent=2)); print(json.dumps(report,indent=2))
           PY
           ls -lh outputs
       - uses: actions/upload-artifact@v4
         with:
-          name: inswapper-real-cpu
+          name: simswap512-real-cpu
           path: outputs/
           retention-days: 2
           compression-level: 0
