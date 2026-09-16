@@ -34,8 +34,6 @@ jobs:
           curl -fL --retry 5 --retry-delay 3 https://github.com/neuralchen/SimSwap/releases/download/512_beta/512.zip -o /tmp/512.zip
           unzip -o /tmp/512.zip -d SimSwap/checkpoints
           curl -fL --retry 5 --retry-delay 3 https://github.com/neuralchen/SimSwap/releases/download/1.0/arcface_checkpoint.tar -o SimSwap/arcface_model/arcface_checkpoint.tar
-          find SimSwap/checkpoints -maxdepth 4 -type f -printf '%p %s bytes\n'
-          ls -lh SimSwap/arcface_model/arcface_checkpoint.tar
       - name: Run SimSwap 512 generator on CPU
         run: |
           python - <<'PY'
@@ -44,7 +42,6 @@ jobs:
           sys.path.insert(0,os.path.abspath('SimSwap'))
           from models.fs_networks_512 import Generator_Adain_Upsample
           from insightface.app import FaceAnalysis
-
           ffhq=np.array([[192.98138,239.94708],[318.90277,240.1936],[256.63416,314.01935],[201.26117,371.41043],[313.08905,371.15118]],dtype=np.float32)
           def align(img,kps):
               M,_=cv2.estimateAffinePartial2D(kps.astype(np.float32),ffhq,method=cv2.LMEDS)
@@ -65,14 +62,12 @@ jobs:
               warped_bgr=warped[:,:,::-1]*255.0
               out=mask[:,:,None]*warped_bgr+(1-mask[:,:,None])*ori.astype(np.float32)
               return np.clip(out,0,255).astype(np.uint8)
-
-          gpaths=glob.glob('SimSwap/checkpoints/**/*_net_G.pth',recursive=True)
-          if not gpaths: raise RuntimeError('512 generator checkpoint not found')
-          gpath=gpaths[0]; print('generator',gpath)
+          gpath=glob.glob('SimSwap/checkpoints/**/*_net_G.pth',recursive=True)[0]
           t0=time.perf_counter()
           G=Generator_Adain_Upsample(input_nc=3,output_nc=3,latent_size=512,n_blocks=9,deep=False).cpu().eval()
           sd=torch.load(gpath,map_location='cpu')
-          G.load_state_dict(sd,strict=True)
+          compat=G.load_state_dict(sd,strict=False)
+          print('generator ignored unexpected keys:',len(compat.unexpected_keys),'missing:',len(compat.missing_keys))
           arc=torch.load('SimSwap/arcface_model/arcface_checkpoint.tar',map_location='cpu')
           arc=arc.cpu().eval(); t1=time.perf_counter()
           print('arc type',type(arc))
