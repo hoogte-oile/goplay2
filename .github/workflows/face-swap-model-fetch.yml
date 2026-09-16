@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Decode and verify inputs
+      - name: Decode inputs
         run: |
           set -euxo pipefail
           mkdir -p inputs outputs weights
@@ -22,12 +22,8 @@ jobs:
           base64 -di .faceswap_eval_20260916/b64/target_male.jpg.b64 > inputs/target_male.jpg
           base64 -di .faceswap_eval_20260916/b64/src_female.jpg.b64 > inputs/src_female.jpg
           base64 -di .faceswap_eval_20260916/b64/target_female.jpg.b64 > inputs/target_female.jpg
-          python - <<'PY'
-          from PIL import Image
-          import os
-          for p in ['inputs/src_male.jpg','inputs/target_male.jpg','inputs/src_female.jpg','inputs/target_female.jpg']:
-              im=Image.open(p); im.verify(); print(p, os.path.getsize(p), im.format)
-          PY
+          file inputs/*.jpg
+          ls -lh inputs
       - name: Install InSwapper CPU stack
         run: |
           set -euxo pipefail
@@ -35,12 +31,15 @@ jobs:
           python -m pip install 'numpy<2' 'opencv-python-headless<4.12' onnxruntime insightface==0.7.3 Pillow
           curl -fL --retry 5 --retry-delay 3 'https://huggingface.co/JackCui/facefusion/resolve/main/inswapper_128.onnx?download=true' -o weights/inswapper_128.onnx
           sha256sum weights/inswapper_128.onnx
-      - name: Run InSwapper male and female on CPU
+      - name: Verify and run InSwapper male and female on CPU
         run: |
           python - <<'PY'
-          import cv2,json,time
+          from PIL import Image
+          import cv2,json,time,os
           from insightface.app import FaceAnalysis
           from insightface.model_zoo import get_model
+          for p in ['inputs/src_male.jpg','inputs/target_male.jpg','inputs/src_female.jpg','inputs/target_female.jpg']:
+              im=Image.open(p); im.verify(); print('verified',p,os.path.getsize(p))
           app=FaceAnalysis(name='buffalo_l',providers=['CPUExecutionProvider'])
           t0=time.perf_counter(); app.prepare(ctx_id=-1,det_size=(640,640)); t1=time.perf_counter()
           swapper=get_model('weights/inswapper_128.onnx',providers=['CPUExecutionProvider']); t2=time.perf_counter()
