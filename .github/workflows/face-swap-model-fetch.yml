@@ -1,8 +1,8 @@
-name: face-swap-cpu-inference
+name: face-swap-cpu-real
 on:
   push:
     branches:
-      - tmp-face-swap-eval-20260916
+      - tmp-face-swap-eval2-20260916
 permissions:
   contents: read
 jobs:
@@ -14,37 +14,54 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install and download
+      - name: Decode and verify inputs
         run: |
           set -euxo pipefail
-          mkdir -p outputs weights
+          mkdir -p inputs outputs weights
+          base64 -d .faceswap_eval_20260916/b64/src_male.jpg.b64 > inputs/src_male.jpg
+          base64 -d .faceswap_eval_20260916/b64/target_male.jpg.b64 > inputs/target_male.jpg
+          base64 -d .faceswap_eval_20260916/b64/src_female.jpg.b64 > inputs/src_female.jpg
+          base64 -d .faceswap_eval_20260916/b64/target_female.jpg.b64 > inputs/target_female.jpg
+          python - <<'PY'
+          from PIL import Image
+          import os
+          for p in ['inputs/src_male.jpg','inputs/target_male.jpg','inputs/src_female.jpg','inputs/target_female.jpg']:
+              im=Image.open(p); im.verify(); print(p, os.path.getsize(p), im.format)
+          PY
+      - name: Install InSwapper CPU stack
+        run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install 'numpy<2' opencv-python-headless onnxruntime insightface==0.7.3
+          python -m pip install 'numpy<2' 'opencv-python-headless<4.12' onnxruntime insightface==0.7.3 Pillow
           curl -fL --retry 5 --retry-delay 3 'https://huggingface.co/JackCui/facefusion/resolve/main/inswapper_128.onnx?download=true' -o weights/inswapper_128.onnx
-      - name: Run male InSwapper on CPU
+          sha256sum weights/inswapper_128.onnx
+      - name: Run InSwapper male and female on CPU
         run: |
           python - <<'PY'
-          import cv2,json,time
+          import cv2,json,time,os
           from insightface.app import FaceAnalysis
           from insightface.model_zoo import get_model
-          root='.faceswap_eval_20260916'
-          src=cv2.imread(f'{root}/src_male.jpg'); tgt=cv2.imread(f'{root}/target_male.jpg')
-          assert src is not None and tgt is not None, 'male image read failed'
-          t0=time.perf_counter(); app=FaceAnalysis(name='buffalo_l',providers=['CPUExecutionProvider']); app.prepare(ctx_id=-1,det_size=(640,640)); t1=time.perf_counter()
+          app=FaceAnalysis(name='buffalo_l',providers=['CPUExecutionProvider'])
+          t0=time.perf_counter(); app.prepare(ctx_id=-1,det_size=(640,640)); t1=time.perf_counter()
           swapper=get_model('weights/inswapper_128.onnx',providers=['CPUExecutionProvider']); t2=time.perf_counter()
-          sf=app.get(src); t3=time.perf_counter(); tf=app.get(tgt); t4=time.perf_counter()
-          if not sf or not tf: raise RuntimeError(f'detection failed src={len(sf)} tgt={len(tf)}')
-          area=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])
-          s=max(sf,key=area); t=max(tf,key=area)
-          out=swapper.get(tgt,t,s,paste_back=True); t5=time.perf_counter()
-          cv2.imwrite('outputs/inswapper_male.jpg',out,[cv2.IMWRITE_JPEG_QUALITY,97])
-          rep={'faceanalysis_init_s':t1-t0,'swapper_load_s':t2-t1,'src_detect_s':t3-t2,'target_detect_s':t4-t3,'swap_s':t5-t4,'total_after_load_s':t5-t2,'src_bbox':[float(x) for x in s.bbox],'target_bbox':[float(x) for x in t.bbox]}
-          open('outputs/inswapper_male_timing.json','w').write(json.dumps(rep,indent=2)); print(json.dumps(rep,indent=2))
+          def largest(fs): return max(fs,key=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+          report={'faceanalysis_init_s':t1-t0,'swapper_load_s':t2-t1,'pairs':{}}
+          for name in ['male','female']:
+              src=cv2.imread(f'inputs/src_{name}.jpg'); tgt=cv2.imread(f'inputs/target_{name}.jpg')
+              a=time.perf_counter(); sf=app.get(src); b=time.perf_counter(); tf=app.get(tgt); c=time.perf_counter()
+              if not sf or not tf: raise RuntimeError(f'detection failed {name}: src={len(sf)} tgt={len(tf)}')
+              s,t=largest(sf),largest(tf)
+              out=swapper.get(tgt,t,s,paste_back=True); d=time.perf_counter()
+              cv2.imwrite(f'outputs/inswapper_{name}.jpg',out,[cv2.IMWRITE_JPEG_QUALITY,98])
+              report['pairs'][name]={'src_detect_s':b-a,'target_detect_s':c-b,'swap_s':d-c,'total_s':d-a,
+                  'src_bbox':[float(x) for x in s.bbox],'target_bbox':[float(x) for x in t.bbox]}
+          open('outputs/inswapper_timing.json','w').write(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
           PY
           ls -lh outputs
       - uses: actions/upload-artifact@v4
         with:
-          name: inswapper-male-cpu-result
+          name: inswapper-real-cpu
           path: outputs/
-          retention-days: 1
+          retention-days: 2
           compression-level: 0
