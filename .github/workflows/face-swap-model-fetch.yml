@@ -18,10 +18,10 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p inputs outputs weights
-          base64 -d .faceswap_eval_20260916/b64/src_male.jpg.b64 > inputs/src_male.jpg
-          base64 -d .faceswap_eval_20260916/b64/target_male.jpg.b64 > inputs/target_male.jpg
-          base64 -d .faceswap_eval_20260916/b64/src_female.jpg.b64 > inputs/src_female.jpg
-          base64 -d .faceswap_eval_20260916/b64/target_female.jpg.b64 > inputs/target_female.jpg
+          base64 -di .faceswap_eval_20260916/b64/src_male.jpg.b64 > inputs/src_male.jpg
+          base64 -di .faceswap_eval_20260916/b64/target_male.jpg.b64 > inputs/target_male.jpg
+          base64 -di .faceswap_eval_20260916/b64/src_female.jpg.b64 > inputs/src_female.jpg
+          base64 -di .faceswap_eval_20260916/b64/target_female.jpg.b64 > inputs/target_female.jpg
           python - <<'PY'
           from PIL import Image
           import os
@@ -38,7 +38,7 @@ jobs:
       - name: Run InSwapper male and female on CPU
         run: |
           python - <<'PY'
-          import cv2,json,time,os
+          import cv2,json,time
           from insightface.app import FaceAnalysis
           from insightface.model_zoo import get_model
           app=FaceAnalysis(name='buffalo_l',providers=['CPUExecutionProvider'])
