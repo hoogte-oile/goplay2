@@ -1,0 +1,29 @@
+name: face-swap-model-fetch
+on:
+  push:
+    branches:
+      - tmp-face-swap-eval-20260916
+permissions:
+  contents: read
+jobs:
+  fetch-models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download model weights
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p weights
+          curl -fL --retry 5 --retry-delay 3 'https://huggingface.co/JackCui/facefusion/resolve/main/inswapper_128.onnx?download=true' -o weights/inswapper_128.onnx
+          curl -fL --retry 5 --retry-delay 3 'https://github.com/neuralchen/SimSwap/releases/download/512_beta/512.zip' -o weights/SimSwap_512.zip
+          ls -lh weights
+          sha256sum weights/* | tee weights/SHA256SUMS.txt
+      - name: Upload weights
+        uses: actions/upload-artifact@v4
+        with:
+          name: face-swap-model-weights
+          path: weights/
+          compression-level: 0
+          retention-days: 1
