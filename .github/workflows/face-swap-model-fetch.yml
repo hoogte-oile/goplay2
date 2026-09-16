@@ -1,4 +1,4 @@
-name: face-swap-model-fetch
+name: face-swap-cpu-inference
 on:
   push:
     branches:
@@ -6,24 +6,64 @@ on:
 permissions:
   contents: read
 jobs:
-  fetch-models:
+  inswapper-cpu:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Download model weights
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Prepare inputs and Python env
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p weights
+          mkdir -p inputs outputs weights
+          unzip -o .faceswap_eval_20260916/inputs.zip -d inputs
+          python -m pip install --upgrade pip
+          python -m pip install 'numpy<2' opencv-python-headless onnxruntime insightface==0.7.3
           curl -fL --retry 5 --retry-delay 3 'https://huggingface.co/JackCui/facefusion/resolve/main/inswapper_128.onnx?download=true' -o weights/inswapper_128.onnx
-          curl -fL --retry 5 --retry-delay 3 'https://github.com/neuralchen/SimSwap/releases/download/512_beta/512.zip' -o weights/SimSwap_512.zip
-          ls -lh weights
-          sha256sum weights/* | tee weights/SHA256SUMS.txt
-      - name: Upload weights
+          sha256sum weights/inswapper_128.onnx
+      - name: Run InSwapper 128 on CPU
+        shell: bash
+        run: |
+          python - <<'PY'
+          import cv2, json, time, os
+          from insightface.app import FaceAnalysis
+          from insightface.model_zoo import get_model
+
+          t0=time.perf_counter()
+          app=FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+          app.prepare(ctx_id=-1, det_size=(640,640))
+          t1=time.perf_counter()
+          swapper=get_model('weights/inswapper_128.onnx', providers=['CPUExecutionProvider'])
+          t2=time.perf_counter()
+
+          def largest(faces):
+              return max(faces, key=lambda f:(f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+
+          report={'faceanalysis_init_s':t1-t0,'swapper_load_s':t2-t1,'pairs':{}}
+          pairs=[
+              ('male','inputs/src_male.jpg','inputs/target_male.jpg'),
+              ('female','inputs/src_female.jpg','inputs/target_female.jpg'),
+          ]
+          for name,srcp,tgtp in pairs:
+              src=cv2.imread(srcp); tgt=cv2.imread(tgtp)
+              a=time.perf_counter(); sf=app.get(src); b=time.perf_counter(); tf=app.get(tgt); c=time.perf_counter()
+              if not sf or not tf: raise RuntimeError(f'face detection failed {name}: src={len(sf)} tgt={len(tf)}')
+              srcface=largest(sf); tgtface=largest(tf)
+              out=swapper.get(tgt,tgtface,srcface,paste_back=True)
+              d=time.perf_counter()
+              outp=f'outputs/inswapper_{name}.jpg'; cv2.imwrite(outp,out,[cv2.IMWRITE_JPEG_QUALITY,97])
+              report['pairs'][name]={'src_detect_s':b-a,'tgt_detect_s':c-b,'swap_s':d-c,'total_s':d-a,'src_bbox':[float(x) for x in srcface.bbox],'tgt_bbox':[float(x) for x in tgtface.bbox]}
+          with open('outputs/inswapper_timing.json','w') as f: json.dump(report,f,indent=2)
+          print(json.dumps(report,indent=2))
+          PY
+          ls -lh outputs
+      - name: Upload InSwapper outputs
         uses: actions/upload-artifact@v4
         with:
-          name: face-swap-model-weights
-          path: weights/
-          compression-level: 0
+          name: inswapper-cpu-results
+          path: outputs/
           retention-days: 1
+          compression-level: 0
